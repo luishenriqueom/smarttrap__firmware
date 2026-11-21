@@ -12,11 +12,11 @@
 #define HELTEC_AP_SSID "smarttrap-gw"
 #define HELTEC_AP_PASSWORD "smarttrap-gw"
 
-#define API_BASE "http://192.168.0.4:8000"
+#define API_BASE "https://st-api.lcdlabs.com.br"
 #define API_KEY "CHANGE_ME"
 #define DEVICE_CODE "trap-02"
 
-#define SLEEP_SECONDS 60
+#define SLEEP_FALLBACK_SECONDS 300
 #define WIFI_TIMEOUT_MS 15000
 
 // GPIO0 preso em LOW no reset entra no bootloader ROM deste módulo.

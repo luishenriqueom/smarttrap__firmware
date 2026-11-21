@@ -41,6 +41,51 @@ static_assert(sizeof(DEVICE_CODE) <= sizeof(SmartTrapUplink::device_code), "DEVI
 static bool loraReady = false;
 static bool cameraReady = false;
 
+struct FrameOption {
+  const char *token;
+  framesize_t size;
+};
+
+static const FrameOption FRAME_OPTIONS[] = {
+    {"qqvga", FRAMESIZE_QQVGA},
+    {"qvga", FRAMESIZE_QVGA},
+    {"vga", FRAMESIZE_VGA},
+    {"svga", FRAMESIZE_SVGA},
+    {"xga", FRAMESIZE_XGA},
+    {"sxga", FRAMESIZE_SXGA},
+    {"uxga", FRAMESIZE_UXGA},
+};
+
+static framesize_t activeSize = FRAMESIZE_SVGA;
+static char activeToken[8] = "svga";
+static uint8_t activeQuality = 12;
+static uint32_t activeSleep = SLEEP_FALLBACK_SECONDS;
+
+static void loadStoredSleep() {
+  Preferences prefs;
+  if (!prefs.begin("smarttrap", true)) {
+    return;
+  }
+  uint32_t stored = prefs.getUInt("slp", SLEEP_FALLBACK_SECONDS);
+  prefs.end();
+  if (stored >= 60 && stored <= 86400) {
+    activeSleep = stored;
+  }
+}
+
+static void storeSleep(uint32_t seconds) {
+  if (seconds < 60 || seconds > 86400) {
+    return;
+  }
+  activeSleep = seconds;
+  Preferences prefs;
+  if (!prefs.begin("smarttrap", false)) {
+    return;
+  }
+  prefs.putUInt("slp", seconds);
+  prefs.end();
+}
+
 static void sleepUntilNext() {
   if (loraReady) {
     LoRa.sleep();
@@ -51,7 +96,7 @@ static void sleepUntilNext() {
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   Serial.flush();
-  esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_SECONDS * 1000000ULL);
+  esp_sleep_enable_timer_wakeup((uint64_t)activeSleep * 1000000ULL);
   esp_deep_sleep_start();
 }
 
@@ -100,11 +145,11 @@ static bool initCamera() {
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.frame_size = FRAMESIZE_SVGA;
+  config.frame_size = activeSize;
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode = CAMERA_GRAB_LATEST;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 12;
+  config.jpeg_quality = activeQuality;
   config.fb_count = 2;
 
   esp_err_t err = esp_camera_init(&config);
@@ -114,6 +159,119 @@ static bool initCamera() {
   }
   cameraReady = true;
   return true;
+}
+
+static const FrameOption *findFrame(const char *token) {
+  for (const FrameOption &option : FRAME_OPTIONS) {
+    if (strcmp(option.token, token) == 0) {
+      return &option;
+    }
+  }
+  return nullptr;
+}
+
+static void rememberToken(const char *token) {
+  strncpy(activeToken, token, sizeof(activeToken) - 1);
+  activeToken[sizeof(activeToken) - 1] = '\0';
+}
+
+static bool validQuality(int quality) {
+  return quality >= 4 && quality <= 63;
+}
+
+static void loadStoredFrameSize() {
+  Preferences prefs;
+  const char *stored = "svga";
+  String saved;
+  if (prefs.begin("smarttrap", true)) {
+    saved = prefs.getString("fs", "svga");
+    int quality = prefs.getUChar("jq", 12);
+    prefs.end();
+    stored = saved.c_str();
+    if (validQuality(quality)) {
+      activeQuality = (uint8_t)quality;
+    }
+  }
+  const FrameOption *option = findFrame(stored);
+  if (option == nullptr) {
+    option = findFrame("svga");
+  }
+  activeSize = option->size;
+  rememberToken(option->token);
+}
+
+static void storeFrameToken(const char *token) {
+  Preferences prefs;
+  if (!prefs.begin("smarttrap", false)) {
+    return;
+  }
+  prefs.putString("fs", token);
+  prefs.end();
+}
+
+static void storeQuality(uint8_t quality) {
+  Preferences prefs;
+  if (!prefs.begin("smarttrap", false)) {
+    return;
+  }
+  prefs.putUChar("jq", quality);
+  prefs.end();
+}
+
+static void discardFrames(int count) {
+  for (int index = 0; index < count; index++) {
+    camera_fb_t *frame = esp_camera_fb_get();
+    if (frame == nullptr) {
+      break;
+    }
+    esp_camera_fb_return(frame);
+  }
+}
+
+static bool applyQuality(uint8_t quality) {
+  if (!validQuality(quality) || quality == activeQuality) {
+    return quality == activeQuality;
+  }
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (sensor == nullptr || sensor->set_quality == nullptr || sensor->set_quality(sensor, quality) != 0) {
+    return false;
+  }
+  activeQuality = quality;
+  storeQuality(quality);
+  discardFrames(1);
+  return true;
+}
+
+static bool applyFrameToken(const char *token) {
+  const FrameOption *option = findFrame(token);
+  if (option == nullptr) {
+    return false;
+  }
+  if (cameraReady && strcmp(activeToken, option->token) == 0) {
+    return true;
+  }
+  framesize_t previousSize = activeSize;
+  char previousToken[8];
+  strncpy(previousToken, activeToken, sizeof(previousToken));
+  previousToken[sizeof(previousToken) - 1] = '\0';
+
+  if (cameraReady) {
+    esp_camera_deinit();
+    cameraReady = false;
+  }
+  activeSize = option->size;
+  rememberToken(option->token);
+  if (initCamera()) {
+    discardFrames(2);
+    storeFrameToken(activeToken);
+    return true;
+  }
+
+  esp_camera_deinit();
+  activeSize = previousSize;
+  rememberToken(previousToken);
+  initCamera();
+  return false;
 }
 
 static bool waitForWifi(uint32_t timeoutMs) {
@@ -171,6 +329,128 @@ static bool beginHttp(HTTPClient &http, WiFiClient &plain, WiFiClientSecure &sec
   }
   http.addHeader("X-API-Key", API_KEY);
   return true;
+}
+
+static bool jsonString(const String &body, const char *key, char *out, size_t outLen) {
+  String needle = String("\"") + key + "\"";
+  int at = body.indexOf(needle);
+  if (at < 0) {
+    return false;
+  }
+  at = body.indexOf(':', at + needle.length());
+  if (at < 0) {
+    return false;
+  }
+  at++;
+  while (at < (int)body.length() && (body[at] == ' ' || body[at] == '\t')) {
+    at++;
+  }
+  if (at >= (int)body.length() || body[at] != '"') {
+    return false;
+  }
+  at++;
+  int end = body.indexOf('"', at);
+  if (end <= at || (size_t)(end - at) >= outLen) {
+    return false;
+  }
+  memcpy(out, body.c_str() + at, end - at);
+  out[end - at] = '\0';
+  return true;
+}
+
+static int jsonInt(const String &body, const char *key) {
+  String needle = String("\"") + key + "\"";
+  int at = body.indexOf(needle);
+  if (at < 0) {
+    return -1;
+  }
+  at = body.indexOf(':', at + needle.length());
+  if (at < 0) {
+    return -1;
+  }
+  return body.substring(at + 1).toInt();
+}
+
+static bool fetchCameraConfig(char *token, size_t tokenLen, int *quality, int *sleepSeconds) {
+  String url = apiBase() + "/api/v1/ingest/config?device_code=" + DEVICE_CODE;
+  WiFiClient plain;
+  WiFiClientSecure secure;
+  HTTPClient http;
+  if (!beginHttp(http, plain, secure, url)) {
+    return false;
+  }
+  http.setTimeout(12000);
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("Configuração: HTTP %d\n", code);
+    http.end();
+    return false;
+  }
+  String body = http.getString();
+  http.end();
+  *quality = jsonInt(body, "jpeg_quality");
+  *sleepSeconds = jsonInt(body, "sleep_seconds");
+  return jsonString(body, "frame_size", token, tokenLen);
+}
+
+static void syncCameraConfig(bool applyNow) {
+  char token[8] = "";
+  int quality = -1;
+  int sleepSeconds = -1;
+  if (!fetchCameraConfig(token, sizeof(token), &quality, &sleepSeconds)) {
+    Serial.printf("Configuração mantida: %s q%d sono %lu s\n", activeToken, activeQuality, (unsigned long)activeSleep);
+    return;
+  }
+  if (sleepSeconds >= 60 && sleepSeconds <= 86400) {
+    storeSleep((uint32_t)sleepSeconds);
+  }
+  bool sizeOk = token[0] != '\0' && findFrame(token) != nullptr;
+  bool qualityOk = validQuality(quality);
+  bool sizeChanged = sizeOk && strcmp(token, activeToken) != 0;
+  bool qualityChanged = qualityOk && (uint8_t)quality != activeQuality;
+  if (token[0] != '\0' && !sizeOk) {
+    Serial.printf("Resolução ignorada: %s\n", token);
+  }
+  if (!sizeChanged && !qualityChanged) {
+    Serial.printf("Configuração %s q%d\n", activeToken, activeQuality);
+    return;
+  }
+  if (!applyNow) {
+    if (sizeChanged) {
+      storeFrameToken(token);
+    }
+    if (qualityChanged) {
+      storeQuality((uint8_t)quality);
+    }
+    Serial.println("Configuração gravada para o próximo ciclo");
+    return;
+  }
+  if (sizeChanged) {
+    uint8_t previousQuality = activeQuality;
+    if (qualityChanged) {
+      activeQuality = (uint8_t)quality;
+    }
+    if (!applyFrameToken(token)) {
+      activeQuality = previousQuality;
+      if (cameraReady) {
+        esp_camera_deinit();
+        cameraReady = false;
+      }
+      initCamera();
+      Serial.printf("Falha ao aplicar %s, permanece %s q%d\n", token, activeToken, activeQuality);
+      return;
+    }
+    if (qualityChanged) {
+      storeQuality(activeQuality);
+    }
+    Serial.printf("Configuração alterada para %s q%d\n", activeToken, activeQuality);
+    return;
+  }
+  if (applyQuality((uint8_t)quality)) {
+    Serial.printf("Qualidade JPEG alterada para %u\n", activeQuality);
+  } else {
+    Serial.printf("Falha ao aplicar qualidade %d, permanece %u\n", quality, activeQuality);
+  }
 }
 
 static bool applyOta() {
@@ -244,13 +524,23 @@ static String isoNow() {
   return String(iso);
 }
 
-static bool uploadJpeg(const uint8_t *data, size_t length) {
+static bool uploadJpeg(const uint8_t *data, size_t length, const char *detections) {
   const String boundary = "SmartTrapBoundary7f3a9c";
+  String detectionPart = "";
+  if (detections != nullptr && detections[0] != '\0') {
+    detectionPart = "--" + boundary + "\r\n"
+                    "Content-Disposition: form-data; name=\"detections\"\r\n\r\n" +
+                    String(detections) + "\r\n";
+  }
   String head = "--" + boundary + "\r\n"
                 "Content-Disposition: form-data; name=\"device_code\"\r\n\r\n" +
                 String(DEVICE_CODE) + "\r\n--" + boundary + "\r\n"
                 "Content-Disposition: form-data; name=\"captured_at\"\r\n\r\n" +
                 isoNow() + "\r\n--" + boundary + "\r\n"
+                "Content-Disposition: form-data; name=\"frame_size\"\r\n\r\n" +
+                String(activeToken) + "\r\n--" + boundary + "\r\n"
+                "Content-Disposition: form-data; name=\"jpeg_quality\"\r\n\r\n" +
+                String(activeQuality) + "\r\n" + detectionPart + "--" + boundary + "\r\n"
                 "Content-Disposition: form-data; name=\"image\"; filename=\"capture.jpg\"\r\n"
                 "Content-Type: image/jpeg\r\n\r\n";
   String tail = "\r\n--" + boundary + "--\r\n";
@@ -307,7 +597,7 @@ static String nextCapturePath() {
   return String(path);
 }
 
-static bool saveJpeg(const uint8_t *data, size_t length) {
+static bool saveJpeg(const uint8_t *data, size_t length, String *savedPath, const char *sidecar) {
   releaseSdBus();
   if (!SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0) || !SD_MMC.begin("/sdcard", true, false, SD_FREQ_KHZ)) {
     Serial.println("SD: cartão indisponível");
@@ -347,7 +637,21 @@ static bool saveJpeg(const uint8_t *data, size_t length) {
     Serial.printf("SD: gravação incompleta (%u/%u)\n", (unsigned)written, (unsigned)length);
     return false;
   }
+  if (sidecar != nullptr) {
+    String sidePath = path;
+    sidePath.replace(".jpg", ".json");
+    File side = SD_MMC.open(sidePath.c_str(), FILE_WRITE);
+    if (!side || side.print(sidecar) != (size_t)strlen(sidecar)) {
+      Serial.println("SD: sidecar não gravado");
+    }
+    if (side) {
+      side.close();
+    }
+  }
   SD_MMC.end();
+  if (savedPath != nullptr) {
+    *savedPath = path;
+  }
   Serial.printf("SD: %s (%u bytes)\n", path.c_str(), (unsigned)written);
   return true;
 }
@@ -361,8 +665,8 @@ static bool captureAndUpload(bool upload) {
     }
     return false;
   }
-  saveJpeg(frame->buf, frame->len);
-  bool sent = !upload || uploadJpeg(frame->buf, frame->len);
+  saveJpeg(frame->buf, frame->len, nullptr, nullptr);
+  bool sent = !upload || uploadJpeg(frame->buf, frame->len, nullptr);
   esp_camera_fb_return(frame);
   return sent;
 }
@@ -411,48 +715,279 @@ static bool otaCommandReceived() {
   return false;
 }
 
+static String detectionsJson(const Inference &result) {
+  String json = "{\"boxes\":[";
+  for (int index = 0; index < result.boxCount; index++) {
+    if (index > 0) {
+      json += ',';
+    }
+    const Detection &box = result.boxes[index];
+    json += "{\"species\":\"";
+    json += box.species;
+    json += "\",\"x\":";
+    json += box.x;
+    json += ",\"y\":";
+    json += box.y;
+    json += ",\"width\":";
+    json += box.width;
+    json += ",\"height\":";
+    json += box.height;
+    json += ",\"confidence\":";
+    json += String(box.confidence, 3);
+    json += '}';
+  }
+  json += "]}";
+  return json;
+}
+
+static String swapExtension(const String &path, const char *extension) {
+  int dot = path.lastIndexOf('.');
+  if (dot < 0) {
+    return path + extension;
+  }
+  return path.substring(0, dot) + extension;
+}
+
+static bool mountSd() {
+  releaseSdBus();
+  return SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0) && SD_MMC.begin("/sdcard", true, false, SD_FREQ_KHZ);
+}
+
+static void markUploaded(const String &jpgPath) {
+  if (jpgPath.length() == 0 || !mountSd()) {
+    return;
+  }
+  File mark = SD_MMC.open(swapExtension(jpgPath, ".up").c_str(), FILE_WRITE);
+  if (mark) {
+    mark.close();
+  }
+  SD_MMC.end();
+}
+
+static bool syncModel() {
+  String url = apiBase() + "/api/v1/ingest/models/current?device_code=" + DEVICE_CODE;
+  WiFiClient plain;
+  WiFiClientSecure secure;
+  HTTPClient http;
+  if (!beginHttp(http, plain, secure, url)) {
+    return false;
+  }
+  int code = http.GET();
+  if (code == 404) {
+    http.end();
+    Serial.println("Modelo: nenhum atribuído");
+    return false;
+  }
+  if (code != 200) {
+    Serial.printf("Modelo: HTTP %d\n", code);
+    http.end();
+    return false;
+  }
+  String body = http.getString();
+  http.end();
+  char sha[80] = "";
+  if (!jsonString(body, "sha256", sha, sizeof(sha))) {
+    return false;
+  }
+  Preferences prefs;
+  prefs.begin("smarttrap", true);
+  String current = prefs.getString("sha", "");
+  prefs.end();
+  if (current == sha && mountSd() && SD_MMC.exists("/model.tflite")) {
+    SD_MMC.end();
+    Serial.println("Modelo já está no cartão");
+    return true;
+  }
+  if (SD_MMC.cardType() != CARD_NONE) {
+    SD_MMC.end();
+  }
+
+  String fileUrl = apiBase() + "/api/v1/ingest/models/current/file?device_code=" + DEVICE_CODE;
+  if (!beginHttp(http, plain, secure, fileUrl)) {
+    return false;
+  }
+  code = http.GET();
+  if (code != 200) {
+    Serial.printf("Modelo arquivo: HTTP %d\n", code);
+    http.end();
+    return false;
+  }
+  if (!mountSd()) {
+    http.end();
+    return false;
+  }
+  SD_MMC.remove("/model.tflite.tmp");
+  File model = SD_MMC.open("/model.tflite.tmp", FILE_WRITE);
+  int written = model ? http.writeToStream(&model) : -1;
+  if (model) {
+    model.close();
+  }
+  http.end();
+  if (written <= 0) {
+    SD_MMC.remove("/model.tflite.tmp");
+    SD_MMC.end();
+    Serial.println("Modelo: download falhou");
+    return false;
+  }
+  SD_MMC.remove("/model.tflite");
+  if (!SD_MMC.rename("/model.tflite.tmp", "/model.tflite")) {
+    SD_MMC.end();
+    Serial.println("Modelo: não renomeou o arquivo");
+    return false;
+  }
+  File meta = SD_MMC.open("/model.json", FILE_WRITE);
+  bool metaOk = meta && meta.print(body) == body.length();
+  if (meta) {
+    meta.close();
+  }
+  SD_MMC.end();
+  if (!metaOk) {
+    Serial.println("Modelo: metadados não gravados");
+    return false;
+  }
+  prefs.begin("smarttrap", false);
+  prefs.putString("sha", sha);
+  prefs.end();
+  Serial.printf("Modelo gravado (%d bytes)\n", written);
+  return true;
+}
+
+static void uploadPending(int limit) {
+  if (!mountSd()) {
+    return;
+  }
+  File folder = SD_MMC.open("/captures");
+  if (!folder) {
+    SD_MMC.end();
+    return;
+  }
+  String pending[3];
+  int found = 0;
+  File entry = folder.openNextFile();
+  while (entry && found < limit) {
+    bool directory = entry.isDirectory();
+    String name = entry.name();
+    entry.close();
+    if (directory) {
+      entry = folder.openNextFile();
+      continue;
+    }
+    if (!name.startsWith("/")) {
+      name = "/captures/" + name;
+    }
+    if (name.endsWith(".jpg") && !SD_MMC.exists(swapExtension(name, ".up").c_str())) {
+      String side = swapExtension(name, ".json");
+      if (SD_MMC.exists(side.c_str())) {
+        pending[found++] = name;
+      }
+    }
+    entry = folder.openNextFile();
+  }
+  folder.close();
+  SD_MMC.end();
+
+  for (int index = 0; index < found; index++) {
+    if (!mountSd()) {
+      return;
+    }
+    File image = SD_MMC.open(pending[index].c_str(), FILE_READ);
+    File side = SD_MMC.open(swapExtension(pending[index], ".json").c_str(), FILE_READ);
+    size_t length = image ? image.size() : 0;
+    String detections = side ? side.readString() : String("{\"boxes\":[]}");
+    uint8_t *data = nullptr;
+    if (image && length > 0 && length <= 1500000) {
+      data = (uint8_t *)ps_malloc(length);
+      if (data == nullptr) {
+        data = (uint8_t *)malloc(length);
+      }
+      if (data != nullptr && image.read(data, length) != length) {
+        free(data);
+        data = nullptr;
+      }
+    }
+    if (image) {
+      image.close();
+    }
+    if (side) {
+      side.close();
+    }
+    SD_MMC.end();
+    if (data != nullptr && uploadJpeg(data, length, detections.c_str())) {
+      markUploaded(pending[index]);
+    }
+    free(data);
+  }
+}
+
 static void inferAndMaybeUpdate() {
+  if (connectWifi()) {
+    syncModel();
+    syncCameraConfig(false);
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+  }
+
   camera_fb_t *frame = esp_camera_fb_get();
-  Inference result{0, -1.0f, false};
-  if (frame != nullptr && frame->format == PIXFORMAT_JPEG) {
-    saveJpeg(frame->buf, frame->len);
-    result = classifyFrame(frame->buf, frame->len);
+  Inference result = {};
+  result.confidence = -1.0f;
+  uint8_t *jpeg = nullptr;
+  size_t length = 0;
+  String savedPath;
+  String detections = "{\"boxes\":[]}";
+  if (frame != nullptr && frame->format == PIXFORMAT_JPEG && frame->len > 0) {
+    jpeg = (uint8_t *)ps_malloc(frame->len);
+    if (jpeg == nullptr) {
+      jpeg = (uint8_t *)malloc(frame->len);
+    }
+    if (jpeg != nullptr) {
+      memcpy(jpeg, frame->buf, frame->len);
+      length = frame->len;
+    }
     esp_camera_fb_return(frame);
   } else if (frame != nullptr) {
     esp_camera_fb_return(frame);
   }
 
-  if (!startLora()) {
-    return;
+  if (jpeg != nullptr) {
+    result = classifyFrame(jpeg, length);
+    detections = detectionsJson(result);
+    saveJpeg(jpeg, length, &savedPath, detections.c_str());
   }
 
-  SmartTrapUplink packet = {};
-  packet.magic = SMARTTRAP_MAGIC;
-  packet.kind = SMARTTRAP_KIND_METRIC;
-  packet.fw_version = FW_VERSION;
-  packet.pest_count = result.ready && result.pestCount > 0 ? (uint16_t)result.pestCount : 0;
-  if (result.ready && result.confidence >= 0.0f && result.confidence <= 1.0f) {
-    packet.confidence = (uint8_t)(result.confidence * 100.0f + 0.5f);
-  } else {
-    packet.confidence = SMARTTRAP_CONF_NONE;
+  bool heardOta = false;
+  if (startLora()) {
+    SmartTrapUplink packet = {};
+    packet.magic = SMARTTRAP_MAGIC;
+    packet.kind = SMARTTRAP_KIND_METRIC;
+    packet.fw_version = FW_VERSION;
+    packet.pest_count = result.ready && result.pestCount > 0 ? (uint16_t)result.pestCount : 0;
+    if (result.ready && result.confidence >= 0.0f && result.confidence <= 1.0f) {
+      packet.confidence = (uint8_t)(result.confidence * 100.0f + 0.5f);
+    } else {
+      packet.confidence = SMARTTRAP_CONF_NONE;
+    }
+    packet.model_ok = result.ready ? 1 : 0;
+    packet.battery_mv = 0;
+    strncpy(packet.device_code, DEVICE_CODE, sizeof(packet.device_code) - 1);
+    LoRa.beginPacket();
+    LoRa.write((const uint8_t *)&packet, sizeof(packet));
+    LoRa.endPacket();
+    LoRa.receive();
+    Serial.printf("LoRa enviado, fw %u, escuta %u ms\n", FW_VERSION, LORA_RX_WINDOW_MS);
+    heardOta = otaCommandReceived();
   }
-  packet.model_ok = result.ready ? 1 : 0;
-  packet.battery_mv = 0;
-  strncpy(packet.device_code, DEVICE_CODE, sizeof(packet.device_code) - 1);
 
-  LoRa.beginPacket();
-  LoRa.write((const uint8_t *)&packet, sizeof(packet));
-  LoRa.endPacket();
-  LoRa.receive();
-  Serial.printf("LoRa enviado, fw %u, escuta %u ms\n", FW_VERSION, LORA_RX_WINDOW_MS);
-
-  if (!otaCommandReceived()) {
-    return;
-  }
-  Serial.println("Comando OTA recebido");
   if (connectWifi()) {
-    applyOta();
+    if (jpeg != nullptr && uploadJpeg(jpeg, length, detections.c_str())) {
+      markUploaded(savedPath);
+    }
+    uploadPending(3);
+    if (heardOta) {
+      Serial.println("Comando OTA recebido");
+      applyOta();
+    }
   }
+  free(jpeg);
 }
 
 void setup() {
@@ -466,12 +1001,24 @@ void setup() {
   uint8_t mode = currentMode();
   Serial.printf("Modo %s%s\n", mode == MODE_INFER ? "infer" : "coleta", maintenance ? " + manutenção" : "");
 
+  loadStoredFrameSize();
+  loadStoredSleep();
   if (!initCamera()) {
-    sleepUntilNext();
+    Serial.printf("Câmera recusou %s, volta para svga\n", activeToken);
+    esp_camera_deinit();
+    activeSize = FRAMESIZE_SVGA;
+    rememberToken("svga");
+    storeFrameToken(activeToken);
+    if (!initCamera()) {
+      sleepUntilNext();
+    }
   }
 
   if (maintenance || mode == MODE_COLLECT) {
     bool online = connectWifi();
+    if (online) {
+      syncCameraConfig(mode == MODE_COLLECT);
+    }
     if (mode == MODE_COLLECT) {
       captureAndUpload(online);
     }
