@@ -37,6 +37,13 @@
 
 static const uint8_t MODE_COLLECT = 0;
 static const uint8_t MODE_INFER = 1;
+static const uint8_t MODE_UNSET = 255;
+
+static_assert(MODE_COLLECT == SMARTTRAP_MODE_COLLECT, "modo coleta");
+static_assert(MODE_INFER == SMARTTRAP_MODE_INFER, "modo inferência");
+
+static uint8_t storedMode = MODE_COLLECT;
+static uint8_t activeMode = MODE_COLLECT;
 
 static_assert(sizeof(DEVICE_CODE) <= sizeof(SmartTrapUplink::device_code), "DEVICE_CODE cabe em 15 caracteres");
 static bool loraReady = false;
@@ -101,17 +108,53 @@ static void sleepUntilNext() {
   esp_deep_sleep_start();
 }
 
+static const char *modeToken(uint8_t mode) {
+  return mode == MODE_INFER ? "infer" : "collect";
+}
+
+static uint8_t modeFromToken(const char *token) {
+  if (strcmp(token, "infer") == 0) {
+    return MODE_INFER;
+  }
+  if (strcmp(token, "collect") == 0) {
+    return MODE_COLLECT;
+  }
+  return MODE_UNSET;
+}
+
+static void storeMode(uint8_t mode) {
+  if (mode != MODE_COLLECT && mode != MODE_INFER) {
+    return;
+  }
+  if (mode == storedMode) {
+    return;
+  }
+  Preferences prefs;
+  if (!prefs.begin("smarttrap", false)) {
+    return;
+  }
+  prefs.putUChar("mode", mode);
+  prefs.end();
+  storedMode = mode;
+  Serial.printf("Modo %s gravado para o próximo ciclo\n", modeToken(mode));
+}
+
 static uint8_t currentMode() {
   Preferences prefs;
-  prefs.begin("smarttrap", false);
-  uint16_t applied = prefs.getUShort("ver", 0);
-  uint8_t mode = prefs.getUChar("mode", MODE_COLLECT);
-  if (applied != FW_VERSION) {
-    mode = FW_MODE_INFER ? MODE_INFER : MODE_COLLECT;
+  if (!prefs.begin("smarttrap", false)) {
+    storedMode = FW_MODE_INFER ? MODE_INFER : MODE_COLLECT;
+    return storedMode;
+  }
+  if (prefs.getUShort("ver", 0) != FW_VERSION) {
     prefs.putUShort("ver", FW_VERSION);
+  }
+  uint8_t mode = prefs.getUChar("mode", MODE_UNSET);
+  if (mode != MODE_COLLECT && mode != MODE_INFER) {
+    mode = FW_MODE_INFER ? MODE_INFER : MODE_COLLECT;
     prefs.putUChar("mode", mode);
   }
   prefs.end();
+  storedMode = mode;
   return mode;
 }
 
@@ -393,7 +436,7 @@ static int jsonInt(const String &body, const char *key) {
 }
 
 static bool fetchCameraConfig(char *token, size_t tokenLen, int *quality, int *sleepSeconds) {
-  String url = apiBase() + "/api/v1/ingest/config?device_code=" + DEVICE_CODE + "&device_time=" + String(unixNow());
+  String url = apiBase() + "/api/v1/ingest/config?device_code=" + DEVICE_CODE + "&device_time=" + String(unixNow()) + "&operating_mode=" + modeToken(activeMode);
   WiFiClient plain;
   WiFiClientSecure secure;
   HTTPClient http;
@@ -412,6 +455,10 @@ static bool fetchCameraConfig(char *token, size_t tokenLen, int *quality, int *s
   int setTime = jsonInt(body, "set_time");
   if (setTime > CLOCK_VALID_AFTER) {
     applyUnixTime((uint32_t)setTime);
+  }
+  char modeName[16] = "";
+  if (jsonString(body, "operating_mode", modeName, sizeof(modeName))) {
+    storeMode(modeFromToken(modeName));
   }
   *quality = jsonInt(body, "jpeg_quality");
   *sleepSeconds = jsonInt(body, "sleep_seconds");
@@ -564,6 +611,8 @@ static bool uploadJpeg(const uint8_t *data, size_t length, const char *detection
                 isoNow() + "\r\n--" + boundary + "\r\n"
                 "Content-Disposition: form-data; name=\"device_time\"\r\n\r\n" +
                 String(unixNow()) + "\r\n--" + boundary + "\r\n"
+                "Content-Disposition: form-data; name=\"operating_mode\"\r\n\r\n" +
+                modeToken(activeMode) + "\r\n--" + boundary + "\r\n"
                 "Content-Disposition: form-data; name=\"frame_size\"\r\n\r\n" +
                 String(activeToken) + "\r\n--" + boundary + "\r\n"
                 "Content-Disposition: form-data; name=\"jpeg_quality\"\r\n\r\n" +
@@ -731,7 +780,13 @@ static bool otaCommandReceived() {
     while (LoRa.available()) {
       LoRa.read();
     }
-    if (got == (int)sizeof(SmartTrapTimeDownlink)) {
+    if (got == (int)sizeof(SmartTrapModeDownlink)) {
+      SmartTrapModeDownlink command;
+      memcpy(&command, buffer, sizeof(command));
+      if (command.magic == SMARTTRAP_MAGIC && command.kind == SMARTTRAP_KIND_MODE) {
+        storeMode(command.operating_mode);
+      }
+    } else if (got == (int)sizeof(SmartTrapTimeDownlink)) {
       SmartTrapTimeDownlink command;
       memcpy(&command, buffer, sizeof(command));
       if (command.magic == SMARTTRAP_MAGIC && command.kind == SMARTTRAP_KIND_TIME) {
@@ -1002,6 +1057,7 @@ static void inferAndMaybeUpdate() {
     packet.model_ok = result.ready ? 1 : 0;
     packet.battery_mv = 0;
     packet.unix_time = unixNow();
+    packet.operating_mode = activeMode;
     strncpy(packet.device_code, DEVICE_CODE, sizeof(packet.device_code) - 1);
     LoRa.beginPacket();
     LoRa.write((const uint8_t *)&packet, sizeof(packet));
@@ -1033,7 +1089,14 @@ void setup() {
 
   bool maintenance = maintenanceHeld();
   uint8_t mode = currentMode();
-  Serial.printf("Modo %s%s\n", mode == MODE_INFER ? "infer" : "coleta", maintenance ? " + manutenção" : "");
+#if !FW_MODE_INFER
+  if (mode == MODE_INFER) {
+    Serial.println("Inferência pedida, firmware sem modelo; segue em coleta");
+    mode = MODE_COLLECT;
+  }
+#endif
+  activeMode = mode;
+  Serial.printf("Modo %s%s\n", modeToken(mode), maintenance ? " + manutenção" : "");
 
   loadStoredFrameSize();
   loadStoredSleep();
