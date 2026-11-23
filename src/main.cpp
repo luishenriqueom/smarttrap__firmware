@@ -9,6 +9,7 @@
 #include <esp_camera.h>
 #include <soc/rtc_cntl_reg.h>
 #include <soc/soc.h>
+#include <sys/time.h>
 #include <time.h>
 
 #include <cstring>
@@ -112,6 +113,26 @@ static uint8_t currentMode() {
   }
   prefs.end();
   return mode;
+}
+
+static const time_t CLOCK_VALID_AFTER = 1700000000;
+
+static uint32_t unixNow() {
+  time_t now = time(nullptr);
+  if (now <= CLOCK_VALID_AFTER) {
+    return 0;
+  }
+  return (uint32_t)now;
+}
+
+static void applyUnixTime(uint32_t unixTime) {
+  if (unixTime <= (uint32_t)CLOCK_VALID_AFTER) {
+    return;
+  }
+  struct timeval value = {};
+  value.tv_sec = (time_t)unixTime;
+  settimeofday(&value, nullptr);
+  Serial.printf("Relógio ajustado: %u\n", unixTime);
 }
 
 static bool maintenanceHeld() {
@@ -372,7 +393,7 @@ static int jsonInt(const String &body, const char *key) {
 }
 
 static bool fetchCameraConfig(char *token, size_t tokenLen, int *quality, int *sleepSeconds) {
-  String url = apiBase() + "/api/v1/ingest/config?device_code=" + DEVICE_CODE;
+  String url = apiBase() + "/api/v1/ingest/config?device_code=" + DEVICE_CODE + "&device_time=" + String(unixNow());
   WiFiClient plain;
   WiFiClientSecure secure;
   HTTPClient http;
@@ -388,6 +409,10 @@ static bool fetchCameraConfig(char *token, size_t tokenLen, int *quality, int *s
   }
   String body = http.getString();
   http.end();
+  int setTime = jsonInt(body, "set_time");
+  if (setTime > CLOCK_VALID_AFTER) {
+    applyUnixTime((uint32_t)setTime);
+  }
   *quality = jsonInt(body, "jpeg_quality");
   *sleepSeconds = jsonInt(body, "sleep_seconds");
   return jsonString(body, "frame_size", token, tokenLen);
@@ -537,6 +562,8 @@ static bool uploadJpeg(const uint8_t *data, size_t length, const char *detection
                 String(DEVICE_CODE) + "\r\n--" + boundary + "\r\n"
                 "Content-Disposition: form-data; name=\"captured_at\"\r\n\r\n" +
                 isoNow() + "\r\n--" + boundary + "\r\n"
+                "Content-Disposition: form-data; name=\"device_time\"\r\n\r\n" +
+                String(unixNow()) + "\r\n--" + boundary + "\r\n"
                 "Content-Disposition: form-data; name=\"frame_size\"\r\n\r\n" +
                 String(activeToken) + "\r\n--" + boundary + "\r\n"
                 "Content-Disposition: form-data; name=\"jpeg_quality\"\r\n\r\n" +
@@ -704,7 +731,13 @@ static bool otaCommandReceived() {
     while (LoRa.available()) {
       LoRa.read();
     }
-    if (got == (int)sizeof(SmartTrapDownlink)) {
+    if (got == (int)sizeof(SmartTrapTimeDownlink)) {
+      SmartTrapTimeDownlink command;
+      memcpy(&command, buffer, sizeof(command));
+      if (command.magic == SMARTTRAP_MAGIC && command.kind == SMARTTRAP_KIND_TIME) {
+        applyUnixTime(command.unix_time);
+      }
+    } else if (got == (int)sizeof(SmartTrapDownlink)) {
       SmartTrapDownlink command;
       memcpy(&command, buffer, sizeof(command));
       if (command.magic == SMARTTRAP_MAGIC && command.kind == SMARTTRAP_KIND_OTA) {
@@ -968,12 +1001,13 @@ static void inferAndMaybeUpdate() {
     }
     packet.model_ok = result.ready ? 1 : 0;
     packet.battery_mv = 0;
+    packet.unix_time = unixNow();
     strncpy(packet.device_code, DEVICE_CODE, sizeof(packet.device_code) - 1);
     LoRa.beginPacket();
     LoRa.write((const uint8_t *)&packet, sizeof(packet));
     LoRa.endPacket();
     LoRa.receive();
-    Serial.printf("LoRa enviado, fw %u, escuta %u ms\n", FW_VERSION, LORA_RX_WINDOW_MS);
+    Serial.printf("LoRa enviado, fw %u, relógio %u, escuta %u ms\n", FW_VERSION, packet.unix_time, LORA_RX_WINDOW_MS);
     heardOta = otaCommandReceived();
   }
 
