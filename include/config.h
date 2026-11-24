@@ -14,10 +14,16 @@
 
 #define API_BASE "https://st-api.lcdlabs.com.br"
 #define API_KEY "CHANGE_ME"
-#define DEVICE_CODE "trap-02"
+#define DEVICE_CODE "trap-01"
 
 #define SLEEP_FALLBACK_SECONDS 300
 #define WIFI_TIMEOUT_MS 15000
+
+// Teresina fica em UTC−3 o ano inteiro. A noite útil é 18:00–06:00,
+// com meia hora a mais em cada ponta para o desvio do oscilador interno.
+#define LOCAL_UTC_OFFSET_SECONDS (-3 * 3600)
+#define NIGHT_START_MINUTE (17 * 60 + 30)
+#define NIGHT_END_MINUTE (6 * 60 + 30)
 
 // GPIO0 preso em LOW no reset entra no bootloader ROM deste módulo.
 // O botão de manutenção liga GPIO33 em GND.

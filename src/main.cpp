@@ -94,7 +94,7 @@ static void storeSleep(uint32_t seconds) {
   prefs.end();
 }
 
-static void sleepUntilNext() {
+static void enterSleep(uint32_t seconds) {
   if (loraReady) {
     LoRa.sleep();
   }
@@ -104,8 +104,12 @@ static void sleepUntilNext() {
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   Serial.flush();
-  esp_sleep_enable_timer_wakeup((uint64_t)activeSleep * 1000000ULL);
+  esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
   esp_deep_sleep_start();
+}
+
+static void sleepUntilNext() {
+  enterSleep(activeSleep);
 }
 
 static const char *modeToken(uint8_t mode) {
@@ -176,6 +180,47 @@ static void applyUnixTime(uint32_t unixTime) {
   value.tv_sec = (time_t)unixTime;
   settimeofday(&value, nullptr);
   Serial.printf("Relógio ajustado: %u\n", unixTime);
+}
+
+static bool localCivilTime(struct tm *local) {
+  time_t now = time(nullptr);
+  if (now <= CLOCK_VALID_AFTER) {
+    return false;
+  }
+  time_t shifted = now + LOCAL_UTC_OFFSET_SECONDS;
+  return gmtime_r(&shifted, local) != nullptr;
+}
+
+static bool inNightWindow(const struct tm *local) {
+  int minute = local->tm_hour * 60 + local->tm_min;
+  return minute >= NIGHT_START_MINUTE || minute < NIGHT_END_MINUTE;
+}
+
+static uint32_t secondsUntilDay(const struct tm *local) {
+  int minute = local->tm_hour * 60 + local->tm_min;
+  int until = minute < NIGHT_END_MINUTE ? NIGHT_END_MINUTE - minute : (24 * 60 - minute) + NIGHT_END_MINUTE;
+  uint32_t seconds = (uint32_t)until * 60u;
+  if (seconds > (uint32_t)local->tm_sec) {
+    seconds -= (uint32_t)local->tm_sec;
+  }
+  if (seconds < 60) {
+    seconds = 60;
+  }
+  return seconds;
+}
+
+static void pauseForNight(bool maintenance) {
+  struct tm local;
+  if (!localCivilTime(&local) || !inNightWindow(&local)) {
+    return;
+  }
+  if (maintenance) {
+    Serial.println("Noite, manutenção segue o ciclo");
+    return;
+  }
+  uint32_t seconds = secondsUntilDay(&local);
+  Serial.printf("Noite %02d:%02d, sem foto; dorme %lu s até %02d:%02d\n", local.tm_hour, local.tm_min, (unsigned long)seconds, NIGHT_END_MINUTE / 60, NIGHT_END_MINUTE % 60);
+  enterSleep(seconds);
 }
 
 static bool maintenanceHeld() {
@@ -1100,6 +1145,7 @@ void setup() {
 
   loadStoredFrameSize();
   loadStoredSleep();
+  pauseForNight(maintenance);
   if (!initCamera()) {
     Serial.printf("Câmera recusou %s, volta para svga\n", activeToken);
     esp_camera_deinit();
